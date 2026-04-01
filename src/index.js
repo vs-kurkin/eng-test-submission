@@ -1,1 +1,1 @@
-﻿console.log('Infrastructure Ready');
+﻿console.log('Infrastructure Ready')

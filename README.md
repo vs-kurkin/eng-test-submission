@@ -1,91 +1,57 @@
-﻿# Solution: Engineering Test (r-nep-kz/eng-test)
+# Решение: Архитектурные паттерны
 
-## 1. Authentication (JWT & Alternatives)
+Привет! В этом репозитории мы разбираем и валидируем несколько ключевых архитектурных подходов для проекта. Цель — уйти от дефолтных решений, которые часто становятся узким горлышком под нагрузкой, и предложить более надежные альтернативы. В коде (`tests/architecture.test.ts`) мы уже набросали базовые тесты для проверки этих концепций.
 
-**Experience & Strategy:**
-JWT has long been the "golden standard" for stateless architectures. However, in large-scale systems or those with high security requirements (e.g., fintech), its conceptual flaws become critical:
-- **Lack of Instant Invalidation:** Revoking a token before TTL expiration requires stateful mechanisms (Blacklists in Redis), which negates the stateless benefit.
-- **Traffic Overhead:** Base64-encoded JSON in every header inflates request size, especially with many roles/permissions.
+Ниже — разбор четырех основных проблем и того, как мы предлагаем их решать на основе объективных технических метрик.
 
-**Alternative Approach (Used in my practice):**
-In high-load microservice environments behind an API Gateway, I've successfully implemented **Opaque Tokens (Reference Tokens)**.
-- **Mechanism:** The client receives a short, cryptographically secure random string. The API Gateway exchanges this for user context (or signs a short-lived internal JWT) via an ultra-fast cache (Redis).
-- **Benefits:** Instant session invalidation (just delete from Redis), minimized external traffic, and internal payload obfuscation.
+## 1. Авторизация: JWT vs. Opaque Tokens
 
-**When to choose JWT?**
-I would choose JWT for public APIs with massive, independent consumers where the cost of checking a database/cache for every request outweighs the risks of delayed invalidation.
+**Проблема:** 
+JWT часто берут по умолчанию для stateless-архитектуры, но у него есть серьезный недостаток — токен нельзя просто так отозвать до истечения его времени жизни (TTL). Если нужно принудительно разлогинить пользователя, приходится городить костыли вроде блэклистов в Redis, что убивает саму идею stateless-подхода. Кроме того, Base64-payload в каждом HTTP-заголовке сильно раздувает трафик.
 
-## 2. Identification (UUID)
+**Решение: Opaque Tokens (Reference Tokens)**
+Вместо того чтобы гонять данные пользователя в самом токене, мы выдаем клиенту короткую криптографически стойкую строку (Opaque Token). 
+- API Gateway (или балансировщик) ходит с этим токеном в ультра-быстрый кэш (Redis), достает контекст пользователя и проксирует запрос дальше в микросервисы (возможно, уже подписывая для них короткоживущий внутренний JWT).
+- **Профит:** Мгновенная инвалидация сессии (просто удаляем ключ из Redis), минимальный оверхед по трафику наружу и полное скрытие внутренностей payload от клиента.
 
-**Problems with UUID v4 in scale:**
-In my experience, random UUID v4 often becomes a performance bottleneck in RDBMS (PostgreSQL/MySQL) due to B-Tree index structure.
-- **Index Fragmentation:** Since UUID v4 is random, new records are inserted at arbitrary points in the tree, causing frequent page splits and degrading INSERT performance.
-- **Cache Efficiency:** At 16 bytes (vs 4/8 bytes for INT/BIGINT), large tables with multiple secondary indexes suffer from index bloat, reducing the efficiency of the database memory buffer (cache misses).
+*В тестах мы замокали Redis и проверили, что флоу работы с Opaque-токеном работает предсказуемо.*
 
-**Solution:**
-For decentralized generation with high-speed indexing, I prefer **UUID v7** (time-ordered). It maintains lexicographical sorting by time, allowing B-Tree indexes to append records sequentially, achieving performance similar to auto-increment keys while preserving global uniqueness.
+## 2. Идентификация: Проблема с UUID v4
 
-## 3. Code Organization (DI & Frameworks)
+**Проблема:** 
+Классический рандомный `UUID v4` отлично подходит для распределенной генерации, но при массовой вставке в реляционные БД (PostgreSQL/MySQL) он ломает производительность. Из-за абсолютной случайности значений новые записи вставляются в произвольные места B-Tree индекса. Это вызывает сильную фрагментацию, частые сплиты страниц (page splits) и раздувание индекса, так как 16-байтные ключи банально хуже помещаются в оперативную память, чем обычные инты, вызывая cache misses.
 
-**The Value of Dependency Injection (DI):**
-The primary benefit of DI is **Testability**. Decoupling logic through IoC (Inversion of Control) allows us to write robust unit tests by easily swapping real database or API repositories with mocks. This leads to 90%+ test coverage without requiring a heavy Docker environment.
+**Решение: UUID v7**
+Мы предлагаем использовать `UUID v7`. В его структуре зашит timestamp, поэтому значения генерируются монотонно возрастая (time-ordered).
+- **Профит:** Сохраняется возможность децентрализованной генерации (без блокировок на стороне БД), но при этом записи в B-Tree индекс добавляются последовательно — почти как при `AUTO_INCREMENT`. Это радикально снижает фрагментацию и держит скорость `INSERT` на стабильно высоком уровне даже на таблицах с десятками миллионов записей.
 
-**Challenges with NestJS/Decorators:**
-- **Magic & Implicit Flow:** Heavy use of decorators (eflect-metadata) can hide the actual execution flow. Understanding the order of Interceptors, Guards, and Pipes becomes complex in large projects.
-- **Runtime DI Errors:** Circular dependencies or "Unknown provider" errors often only appear at startup, making debugging tedious in large monoliths compared to compile-time DI.
+## 3. Организация кода: DI и «магия» фреймворков
 
-## 4. Reactivity (React)
+**Проблема:** 
+Фреймворки вроде NestJS предоставляют мощные инструменты, но в крупных проектах обилие декораторов (`@Injectable()`, `@UseGuards()`) и неявного Dependency Injection через `reflect-metadata` превращает флоу выполнения кода в "магию". Понять порядок отработки интерцепторов и пайпов становится сложно. Кроме того, ошибки DI (например, циклические зависимости) часто стреляют только в рантайме при старте приложения, что усложняет дебаг.
 
-**When Reactivity is a Hindrance:**
-The main challenge in React's reactivity is **Implicit Cascade Re-renders**.
-In high-performance UIs (interactive maps, real-time charts, Canvas/WebGL), binding cursor coordinates or 1000s of object positions to useState triggers heavy Virtual DOM reconciliation (60fps), leading to frame drops.
+**Решение: Явный Dependency Injection (DI)**
+Главный профит DI — это тестируемость. Отвязывание бизнес-логики от инфраструктуры через Inversion of Control (IoC) позволяет писать быстрые юнит-тесты без поднятия базы данных или тяжелого Docker-окружения. 
+Вместо того чтобы полагаться на неявную магию декораторов, в этом проекте мы валидируем использование более прозрачных DI-контейнеров (например, `awilix`).
 
-**Alternative Rendering Principle:**
-In such cases, I bypass React's reactive cycle for specific components. I use useRef for mutable state and update the DOM/Canvas imperatively via equestAnimationFrame. React is used only as a mounter for the root element.
+*В `tests/architecture.test.ts` мы проверяем целостность DI-контейнера: проверяем, что сервисы резолвятся корректно, а зависимости пробрасываются явно.*
 
-**React Implementation Pain Points:**
-- **Lack of Granularity:** Unlike Solid.js or Svelte, React doesn't know *which* property changed. It re-renders the whole component tree, forcing developers to use "optimization mines" like useMemo, useCallback, and React.memo.
-- **useEffect Complexity:** The paradigm of synchronizing effects with state is prone to race conditions, infinite loops, and stale closures if the dependency array is slightly off.
+## 4. Реактивность: Когда React мешает
 
----
+**Проблема:** 
+Основная боль React — неявные каскадные ререндеры. При разработке UI с высокими требованиями к производительности (например, интерактивные карты, графики реального времени или Canvas/WebGL-сцены), привязка координат или сотен объектов к стейту (`useState`) заставляет Virtual DOM постоянно сверять деревья (reconciliation). На частоте 60 FPS это неминуемо приводит к просадкам кадров и тормозам главного потока.
 
-## Roadmap: Enterprise System Architecture
-
-### Phase 1: Foundation (Security & Identity)
-- [ ] Implement UUID v7 for all write-intensive tables.
-- [ ] Deploy API Gateway with Opaque Token support + Redis session management.
-- [ ] Define Docker-base images (Node.js slim) and resource limits (IaC).
-
-### Phase 2: Core Services & DI
-- [ ] Model domain entities with Strict Typing.
-- [ ] Configure IoC Container (registration of services, repositories, adapters).
-- [ ] Implement Event-Driven messaging (e.g., RabbitMQ) with idempotency.
-
-### Phase 3: UI & Reactivity
-- [ ] Build Atomic Component library with TypeScript.
-- [ ] Establish State Management strategy (minimizing useEffect).
-- [ ] Optimize performance-critical renders (Canvas/Web Workers).
-
-### Phase 4: Validation & Hardening
-- [ ] Achieve 90%+ Test Coverage (Unit/Integration/E2E).
-- [ ] Perform Load Testing on B-Tree indexes with massive data volumes.
+**Решение: Императивный рендеринг в обход React**
+Для performance-critical компонентов мы "выключаем" реактивность React:
+- Часто меняющееся состояние (например, координаты мыши или позиции объектов) хранится в `useRef` (оно мутабельно и изменение не вызывает ререндер).
+- Обновление DOM-узлов или Canvas происходит императивно через прямые подписки и `requestAnimationFrame`.
+- React в данном случае выступает исключительно как инструмент для первоначального маунтинга (рендера) корневого элемента.
 
 ---
 
-## Test Cases (Validation Scenarios)
+## План внедрения (Roadmap)
 
-### Case 1: Session Invalidation (Auth)
-- **Scenario:** User clicks "Logout from all devices" after suspicious activity.
-- **Expected:** Redis key is deleted; all subsequent requests return 401 Unauthorized in <50ms (Zero Propagation Delay).
-
-### Case 2: Write Performance at Scale (Identity)
-- **Scenario:** Load testing Events table with 10M+ records using UUID v4 vs UUID v7.
-- **Expected:** UUID v7 shows stable insert speed with minimal page splits compared to UUID v4.
-
-### Case 3: Dependency Isolation (DI)
-- **Scenario:** External Billing API is down.
-- **Expected:** Unit test with Mock Billing verifies that the system handles failure gracefully (Retry/Circuit Breaker) without logic changes.
-
-### Case 4: FPS Stability (React Performance)
-- **Scenario:** Dynamically updating 1000+ items at 30fps.
-- **Expected:** React Profiler shows no cascade re-renders in unrelated branches; Main Thread idle > 50%.
+1. **Инфраструктура:** Разворачивание API Gateway с поддержкой Opaque Tokens + Redis для управления сессиями.
+2. **Базы данных:** Миграция primary-ключей на `UUID v7` для таблиц с высокой интенсивностью записи.
+3. **Бэкенд:** Настройка прозрачного IoC-контейнера для DI, строгая типизация доменных сущностей.
+4. **Фронтенд:** Разделение UI на реактивные (обычный React) и нереактивные (WebGL/Canvas с императивным обновлением) компоненты. Оптимизация горячих путей рендеринга.
